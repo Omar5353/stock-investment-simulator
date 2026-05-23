@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.png
+*.pdf
+*.csv
+webull/
+Claude_simulator/
+.DS_Store
