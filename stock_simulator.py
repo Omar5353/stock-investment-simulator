@@ -74,64 +74,98 @@ def calc_arr(total_profit: float, total_invested: float, years: float) -> float:
 
 
 # ── Capital gains tax ─────────────────────────────────────────────────────────
+# Short-term: held ≤ 365 days → 20%   Long-term: held > 365 days → 10%
 
-def calc_tax_liability(buy_df: pd.DataFrame, end_date, final_close: float,
+def calc_tax_breakdown(buy_df: pd.DataFrame, end_date, final_close: float,
                        sell_df=None,
-                       short_rate: float = 0.20, long_rate: float = 0.10) -> float:
+                       short_rate: float = 0.20, long_rate: float = 0.10):
     """
-    FIFO-based capital gains tax estimate.
+    FIFO capital gains tax with full per-lot detail.
+    Returns (total_tax: float, breakdown: list[dict]).
 
-    - For each sell event (ATH B&S): match shares against oldest lots first.
-      Gain = (sell_price − lot_cost) × shares.
-      Held < 365 days → short_rate; ≥ 365 days → long_rate.
-    - Remaining unsold lots are valued at final_close on end_date.
-    Only positive gains are taxed (losses are ignored / not offset).
-    Returns total estimated tax (float).
+    Each breakdown entry is a dict:
+      type        : 'sell' | 'end_of_period'
+      date        : pd.Timestamp
+      sell_price  : float
+      lots        : list of lot dicts (buy_date, buy_price, shares, gain,
+                                       days_held, term, rate, tax)
+      total_gain  : float
+      total_tax   : float
+
+    Long-term threshold: held > 365 days.
+    Only positive gains are taxed.
     """
     if buy_df.empty:
-        return 0.0
+        return 0.0, []
 
     end_ts    = pd.Timestamp(end_date)
     price_col = 'Price' if 'Price' in buy_df.columns else 'Close'
 
-    # Build FIFO lot queue: list of [buy_date, remaining_shares, cost_per_share]
     lots: list = []
     for _, row in buy_df.iterrows():
         lots.append([row['Date'], float(row['shares_bought']), float(row[price_col])])
 
     total_tax = 0.0
+    breakdown = []
 
-    # ── Process actual sell events (ATH Buy & Sell only) ──────────────────────
+    def _lot_entry(lot_date, shares, lot_cost, exit_price, exit_date):
+        gain      = (exit_price - lot_cost) * shares
+        days_held = (exit_date - lot_date).days
+        is_long   = days_held > 365
+        rate      = long_rate if is_long else short_rate
+        tax       = gain * rate if gain > 0 else 0.0
+        return dict(buy_date=lot_date, buy_price=lot_cost, shares=shares,
+                    gain=gain, days_held=days_held,
+                    term='Long' if is_long else 'Short',
+                    rate=rate, tax=tax)
+
+    # ── Actual sell events ────────────────────────────────────────────────────
     if sell_df is not None and not sell_df.empty:
         for _, sell_row in sell_df.iterrows():
             to_sell    = float(sell_row['Shares'])
             sell_price = float(sell_row['Price'])
             sell_date  = sell_row['Date']
+            event      = dict(type='sell', date=sell_date, sell_price=sell_price,
+                              lots=[], total_gain=0.0, total_tax=0.0)
 
             while to_sell > 1e-9 and lots:
                 lot_date, lot_shares, lot_cost = lots[0]
-                taken     = min(to_sell, lot_shares)
-                gain      = (sell_price - lot_cost) * taken
-                days_held = (sell_date - lot_date).days
-                rate      = long_rate if days_held >= 365 else short_rate
-                if gain > 0:
-                    total_tax += gain * rate
+                taken = min(to_sell, lot_shares)
+                e     = _lot_entry(lot_date, taken, lot_cost, sell_price, sell_date)
+                event['lots'].append(e)
+                event['total_gain'] += e['gain']
+                event['total_tax']  += e['tax']
+                total_tax           += e['tax']
                 lots[0][1] -= taken
                 to_sell    -= taken
                 if lots[0][1] < 1e-9:
                     lots.pop(0)
 
-    # ── Remaining (unsold) lots — taxed at final_close on end_date ───────────
-    for lot_date, lot_shares, lot_cost in lots:
-        if lot_shares < 1e-9:
-            continue
-        gain      = (final_close - lot_cost) * lot_shares
-        days_held = (end_ts - lot_date).days
-        rate      = long_rate if days_held >= 365 else short_rate
-        if gain > 0:
-            total_tax += gain * rate
+            breakdown.append(event)
 
-    return total_tax
+    # ── Remaining lots at end of period ───────────────────────────────────────
+    remaining = [(d, s, c) for d, s, c in lots if s > 1e-9]
+    if remaining:
+        event = dict(type='end_of_period', date=end_ts, sell_price=final_close,
+                     lots=[], total_gain=0.0, total_tax=0.0)
+        for lot_date, lot_shares, lot_cost in remaining:
+            e = _lot_entry(lot_date, lot_shares, lot_cost, final_close, end_ts)
+            event['lots'].append(e)
+            event['total_gain'] += e['gain']
+            event['total_tax']  += e['tax']
+            total_tax           += e['tax']
+        breakdown.append(event)
+
+    return total_tax, breakdown
+
+
+def calc_tax_liability(buy_df: pd.DataFrame, end_date, final_close: float,
+                       sell_df=None,
+                       short_rate: float = 0.20, long_rate: float = 0.10) -> float:
+    """Convenience wrapper — returns only total tax."""
+    total, _ = calc_tax_breakdown(buy_df, end_date, final_close,
+                                  sell_df, short_rate, long_rate)
+    return total
 
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
@@ -398,8 +432,9 @@ def simulate_ath_buy_sell(df, start_date, end_date, amount, frequency,
 
     # Tax: FIFO match against actual sells, remaining lots at final close
     final_close = float(df['Close'].iloc[-1])
-    total_tax   = calc_tax_liability(buy_df, end_date, final_close,
-                                     sell_df=sell_df if sell_trades else None)
+    total_tax, tax_breakdown = calc_tax_breakdown(
+        buy_df, end_date, final_close,
+        sell_df=sell_df if sell_trades else None)
     net_profit_val = profit - total_tax
     net_pct_val    = net_profit_val / total_invested * 100 if total_invested else 0.0
 
@@ -418,6 +453,7 @@ def simulate_ath_buy_sell(df, start_date, end_date, amount, frequency,
         total_tax=total_tax,
         net_profit=net_profit_val,
         net_pct=net_pct_val,
+        tax_breakdown=tax_breakdown,
     )
     return df, buy_df, sell_df, summary
 
@@ -432,6 +468,7 @@ class StockSimulator(tk.Tk):
         self.geometry("1380x900")
         self.minsize(1000, 720)
         self.configure(bg=BG)
+        self._tax_breakdown = None   # populated after ATH B&S run
         self._setup_style()
         self._build_ui()
         self.after(100, self.focus_force)   # ensure window gets focus on start
@@ -620,6 +657,16 @@ class StockSimulator(tk.Tk):
                               font=FONT_BOLD, anchor='e')
             lbl_w.pack(side='right', padx=8)
             self._result_vars[key] = (var, lbl_w, kind)
+
+        # ── Tax breakdown button (ATH B&S only) ───────────────────────────────
+        self.tax_btn = tk.Button(
+            sidebar, text="📋  Tax Breakdown Detail",
+            bg=CARD, fg=MUTED, font=FONT_SMALL,
+            relief='flat', bd=0, padx=8, pady=6,
+            cursor='hand2', state='disabled',
+            command=self._show_tax_breakdown)
+        self.tax_btn.pack(fill='x', padx=12, pady=(0, 14))
+        self.tax_btn.bind('<ButtonRelease-1>', lambda _: self._show_tax_breakdown())
 
         # ── Plot area ─────────────────────────────────────────────────────────
         plot_frame = tk.Frame(self, bg=BG)
@@ -811,6 +858,15 @@ class StockSimulator(tk.Tk):
             else:
                 lbl_w.config(fg=GREEN)
 
+        # Tax breakdown button — only active for ATH B&S
+        if strat == "ATH Buy & Sell" and summary.get('tax_breakdown'):
+            self._tax_breakdown = summary['tax_breakdown']
+            self.tax_btn.config(state='normal', fg=ACCENT, bg=CARD,
+                                activebackground=BORDER, activeforeground=TEXT)
+        else:
+            self._tax_breakdown = None
+            self.tax_btn.config(state='disabled', fg=MUTED, bg=CARD)
+
         self._draw_plots(ticker, daily, buy_df, sell_df, summary)
 
     # ── Plots ─────────────────────────────────────────────────────────────────
@@ -889,6 +945,109 @@ class StockSimulator(tk.Tk):
 
         # auto-save after every simulation run
         self._save_plots(ticker, summary)
+
+    # ── Tax breakdown popup ───────────────────────────────────────────────────
+
+    def _show_tax_breakdown(self):
+        if not self._tax_breakdown or self.tax_btn['state'] == 'disabled':
+            return
+
+        win = tk.Toplevel(self)
+        win.title("Tax Breakdown — ATH Buy & Sell")
+        win.configure(bg=BG)
+        win.geometry("880x620")
+        win.minsize(700, 400)
+
+        # header label
+        tk.Label(win, text="Capital Gains Tax Breakdown  (FIFO)  •  Short-term ≤ 1 yr: 20%   Long-term > 1 yr: 10%",
+                 bg=BG, fg=ACCENT, font=FONT_BOLD).pack(anchor='w', padx=10, pady=(8, 2))
+        tk.Label(win, text="Red = short-term   Green = long-term   Yellow = unrealized (end of period)",
+                 bg=BG, fg=MUTED, font=FONT_SMALL).pack(anchor='w', padx=10, pady=(0, 6))
+
+        # scrollable text area
+        frame = tk.Frame(win, bg=BG)
+        frame.pack(fill='both', expand=True, padx=8, pady=(0, 4))
+
+        sb_y = ttk.Scrollbar(frame, orient='vertical')
+        sb_y.pack(side='right', fill='y')
+        sb_x = ttk.Scrollbar(frame, orient='horizontal')
+        sb_x.pack(side='bottom', fill='x')
+
+        txt = tk.Text(frame, bg=CARD, fg=TEXT,
+                      font=('Courier New', 9),
+                      yscrollcommand=sb_y.set, xscrollcommand=sb_x.set,
+                      wrap='none', padx=10, pady=8, relief='flat', bd=0,
+                      selectbackground=BORDER)
+        txt.pack(fill='both', expand=True)
+        sb_y.config(command=txt.yview)
+        sb_x.config(command=txt.xview)
+
+        txt.tag_config('hdr',     foreground=ACCENT,  font=('Courier New', 9, 'bold'))
+        txt.tag_config('col',     foreground=SUBTEXT, font=('Courier New', 9, 'bold'))
+        txt.tag_config('short',   foreground=RED)
+        txt.tag_config('long',    foreground=GREEN)
+        txt.tag_config('unreal',  foreground=YELLOW)
+        txt.tag_config('total',   foreground=ACCENT,  font=('Courier New', 9, 'bold'))
+        txt.tag_config('muted',   foreground=MUTED)
+        txt.tag_config('sep',     foreground=BORDER)
+
+        W   = 96
+        SEP  = '─' * W + '\n'
+        SEP2 = '═' * W + '\n'
+
+        COL = (f"  {'Buy Date':<12}  {'Buy $':>8}  {'Shares':>10}  "
+               f"{'Gain ($)':>13}  {'Days':>5}  {'Term':<6}  {'Rate':>5}  {'Tax ($)':>13}\n")
+
+        sell_idx   = 0
+        total_all  = 0.0
+
+        for event in self._tax_breakdown:
+            is_sell = event['type'] == 'sell'
+
+            if is_sell:
+                sell_idx += 1
+                total_shares = sum(l['shares'] for l in event['lots'])
+                hdr = (f"  SELL #{sell_idx}  —  {event['date'].strftime('%Y-%m-%d')}  "
+                       f"@  ${event['sell_price']:,.2f}  "
+                       f"({total_shares:.4f} shares sold)\n")
+                hdr_tag = 'hdr'
+            else:
+                hdr = (f"  END OF PERIOD (Unrealized)  —  {event['date'].strftime('%Y-%m-%d')}  "
+                       f"@  ${event['sell_price']:,.2f}\n")
+                hdr_tag = 'unreal'
+
+            txt.insert('end', SEP, 'sep')
+            txt.insert('end', hdr, hdr_tag)
+            txt.insert('end', SEP, 'sep')
+            txt.insert('end', COL, 'col')
+            txt.insert('end', '  ' + '·' * (W - 2) + '\n', 'muted')
+
+            for lot in event['lots']:
+                tag  = 'long' if lot['term'] == 'Long' else ('unreal' if not is_sell else 'short')
+                line = (f"  {lot['buy_date'].strftime('%Y-%m-%d'):<12}  "
+                        f"${lot['buy_price']:>7,.2f}  "
+                        f"{lot['shares']:>10.4f}  "
+                        f"${lot['gain']:>12,.2f}  "
+                        f"{lot['days_held']:>5}  "
+                        f"{lot['term']:<6}  "
+                        f"{lot['rate']*100:>4.0f}%  "
+                        f"${lot['tax']:>12,.2f}\n")
+                txt.insert('end', line, tag)
+
+            # event subtotal
+            txt.insert('end', '  ' + '─' * (W - 2) + '\n', 'muted')
+            sub = (f"  {'Subtotal':<12}  {'':>8}  "
+                   f"{sum(l['shares'] for l in event['lots']):>10.4f}  "
+                   f"${event['total_gain']:>12,.2f}  "
+                   f"{'':>5}  {'':>6}  {'':>5}  "
+                   f"${event['total_tax']:>12,.2f}\n\n")
+            txt.insert('end', sub, 'total')
+            total_all += event['total_tax']
+
+        txt.insert('end', SEP2, 'sep')
+        txt.insert('end', f"  TOTAL ESTIMATED TAX:  ${total_all:,.2f}\n", 'total')
+        txt.insert('end', SEP2, 'sep')
+        txt.config(state='disabled')
 
     # ── Save plots ────────────────────────────────────────────────────────────
 
