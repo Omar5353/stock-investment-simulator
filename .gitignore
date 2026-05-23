@@ -6,3 +6,5 @@ __pycache__/
 webull/
 Claude_simulator/
 .DS_Store
+# simulation output folders (YYYYMMDD_HHMMSS/)
+[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_*/
