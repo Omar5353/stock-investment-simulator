@@ -319,6 +319,40 @@ fig.update_annotations(font_color='#cdd6f4')
 
 st.plotly_chart(fig, use_container_width=True)
 
+# ── Download buttons ──────────────────────────────────────────────────────────
+_strat_slug = strat.replace(' ', '_').replace('&', 'and')
+_gain_slug  = f"{float(summary['pct_gain']):+.0f}pct"
+_base_name  = (f"{ticker}_{_strat_slug}_{freq}_"
+               f"{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}_"
+               f"{_gain_slug}")
+
+_dl1, _dl2, _spacer = st.columns([1, 1, 4])
+
+# PNG — requires kaleido
+with _dl1:
+    try:
+        _png_bytes = fig.to_image(format='png', width=1600, height=800, scale=2)
+        st.download_button(
+            label="⬇️ Download PNG",
+            data=_png_bytes,
+            file_name=f"{_base_name}.png",
+            mime="image/png",
+            use_container_width=True,
+        )
+    except Exception:
+        st.caption("PNG unavailable (kaleido not installed)")
+
+# Interactive HTML — no extra deps
+with _dl2:
+    _html_bytes = fig.to_html(include_plotlyjs='cdn', full_html=True).encode('utf-8')
+    st.download_button(
+        label="⬇️ Download HTML",
+        data=_html_bytes,
+        file_name=f"{_base_name}.html",
+        mime="text/html",
+        use_container_width=True,
+    )
+
 # ── Tax breakdown (ATH B&S only) ──────────────────────────────────────────────
 if strat == "ATH Buy & Sell" and summary.get('tax_breakdown'):
     breakdown = summary['tax_breakdown']
