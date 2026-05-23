@@ -73,6 +73,67 @@ def calc_arr(total_profit: float, total_invested: float, years: float) -> float:
     return avg_annual_profit / total_invested * 100
 
 
+# ── Capital gains tax ─────────────────────────────────────────────────────────
+
+def calc_tax_liability(buy_df: pd.DataFrame, end_date, final_close: float,
+                       sell_df=None,
+                       short_rate: float = 0.20, long_rate: float = 0.10) -> float:
+    """
+    FIFO-based capital gains tax estimate.
+
+    - For each sell event (ATH B&S): match shares against oldest lots first.
+      Gain = (sell_price − lot_cost) × shares.
+      Held < 365 days → short_rate; ≥ 365 days → long_rate.
+    - Remaining unsold lots are valued at final_close on end_date.
+    Only positive gains are taxed (losses are ignored / not offset).
+    Returns total estimated tax (float).
+    """
+    if buy_df.empty:
+        return 0.0
+
+    end_ts    = pd.Timestamp(end_date)
+    price_col = 'Price' if 'Price' in buy_df.columns else 'Close'
+
+    # Build FIFO lot queue: list of [buy_date, remaining_shares, cost_per_share]
+    lots: list = []
+    for _, row in buy_df.iterrows():
+        lots.append([row['Date'], float(row['shares_bought']), float(row[price_col])])
+
+    total_tax = 0.0
+
+    # ── Process actual sell events (ATH Buy & Sell only) ──────────────────────
+    if sell_df is not None and not sell_df.empty:
+        for _, sell_row in sell_df.iterrows():
+            to_sell    = float(sell_row['Shares'])
+            sell_price = float(sell_row['Price'])
+            sell_date  = sell_row['Date']
+
+            while to_sell > 1e-9 and lots:
+                lot_date, lot_shares, lot_cost = lots[0]
+                taken     = min(to_sell, lot_shares)
+                gain      = (sell_price - lot_cost) * taken
+                days_held = (sell_date - lot_date).days
+                rate      = long_rate if days_held >= 365 else short_rate
+                if gain > 0:
+                    total_tax += gain * rate
+                lots[0][1] -= taken
+                to_sell    -= taken
+                if lots[0][1] < 1e-9:
+                    lots.pop(0)
+
+    # ── Remaining (unsold) lots — taxed at final_close on end_date ───────────
+    for lot_date, lot_shares, lot_cost in lots:
+        if lot_shares < 1e-9:
+            continue
+        gain      = (final_close - lot_cost) * lot_shares
+        days_held = (end_ts - lot_date).days
+        rate      = long_rate if days_held >= 365 else short_rate
+        if gain > 0:
+            total_tax += gain * rate
+
+    return total_tax
+
+
 # ── Shared helpers ────────────────────────────────────────────────────────────
 
 FREQ_STEPS = {'Daily': 1, 'Weekly': 5, 'Biweekly': 10, 'Monthly': 21}
@@ -110,6 +171,7 @@ def _base_stats(daily, total_invested, buy_count, buy_dates, final_value=None, *
         arr=arr,
         total_shares=float(daily['shares_cum'].iloc[-1]),
         buy_count=buy_count,
+        sell_count=0,
         **extra,
     )
 
@@ -133,6 +195,14 @@ def simulate_base_dca(df, start_date, end_date, amount, frequency):
     daily          = _portfolio_series(df, buy_df)
     total_invested = amount * len(buy_df)
     summary = _base_stats(daily, total_invested, len(buy_df), list(buy_df['Date']))
+
+    # Tax: all lots held to end date, valued at final close
+    final_close = float(daily['Close'].iloc[-1])
+    total_tax   = calc_tax_liability(buy_df, end_date, final_close)
+    net_profit  = summary['profit'] - total_tax
+    net_pct     = net_profit / total_invested * 100 if total_invested else 0.0
+    summary.update(total_tax=total_tax, net_profit=net_profit, net_pct=net_pct)
+
     return daily, buy_df, summary
 
 
@@ -196,6 +266,14 @@ def simulate_drawdown_dca(df, start_date, end_date, amount, frequency,
 
     buy_dates = list(buy_df['Date']) if not buy_df.empty else []
     summary   = _base_stats(df, invested, len(buy_df), buy_dates, cycles=cycle_id)
+
+    # Tax: all lots held to end date, valued at final close
+    final_close = float(df['Close'].iloc[-1])
+    total_tax   = calc_tax_liability(buy_df, end_date, final_close)
+    net_profit  = summary['profit'] - total_tax
+    net_pct     = net_profit / invested * 100 if invested else 0.0
+    summary.update(total_tax=total_tax, net_profit=net_profit, net_pct=net_pct)
+
     return df, buy_df, summary
 
 
@@ -308,6 +386,13 @@ def simulate_ath_buy_sell(df, start_date, end_date, amount, frequency,
     cagr  = ((final_value / first) ** (1 / years) - 1) * 100 if (first and years > 0 and final_value > 0) else float('nan')
     arr   = calc_arr(profit, total_invested, years)
 
+    # Tax: FIFO match against actual sells, remaining lots at final close
+    final_close = float(df['Close'].iloc[-1])
+    total_tax   = calc_tax_liability(buy_df, end_date, final_close,
+                                     sell_df=sell_df if sell_trades else None)
+    net_profit_val = profit - total_tax
+    net_pct_val    = net_profit_val / total_invested * 100 if total_invested else 0.0
+
     summary = dict(
         total_invested=total_invested,
         final_value=final_value,
@@ -320,6 +405,9 @@ def simulate_ath_buy_sell(df, start_date, end_date, amount, frequency,
         sell_count=len(sell_df),
         cycles=cycle_id,
         realized=realized,
+        total_tax=total_tax,
+        net_profit=net_profit_val,
+        net_pct=net_pct_val,
     )
     return df, buy_df, sell_df, summary
 
@@ -494,13 +582,17 @@ class StockSimulator(tk.Tk):
 
         self._result_vars = {}
         result_rows = [
-            ('total_invested', 'Total Invested',  None),
-            ('final_value',    'Final Value',      None),
-            ('profit',         'Capital Gain',     'signed'),
-            ('pct_gain',       'Total Return',     'signed_pct'),
-            ('cagr',           'CAGR',             'signed_pct'),
-            ('arr',            'ARR',              'signed_pct'),
-            ('buy_count',      '# of Buys',        None),
+            ('total_invested', 'Total Invested',       None),
+            ('final_value',    'Final Value',           None),
+            ('profit',         'Capital Gain',          'signed'),
+            ('pct_gain',       'Total Return',          'signed_pct'),
+            ('cagr',           'CAGR',                  'signed_pct'),
+            ('arr',            'ARR',                   'signed_pct'),
+            ('buy_count',      '# of Buys',             None),
+            ('sell_count',     '# of Sells',            None),
+            ('total_tax',      'Est. Tax (20%/10%)',    'signed'),
+            ('net_profit',     'Net Gain (After Tax)',  'signed'),
+            ('net_pct',        'Net Return (After Tax)','signed_pct'),
         ]
 
         results_frame = tk.Frame(sidebar, bg=PANEL)
@@ -664,8 +756,6 @@ class StockSimulator(tk.Tk):
             s  = pct(fv) if is_pct else usd(fv)
             return f"+{s}" if fv >= 0 else s
 
-        nan_val = float('nan')
-
         def safe_pct(v):
             fv = float(v)
             if np.isnan(fv):
@@ -680,20 +770,25 @@ class StockSimulator(tk.Tk):
             'cagr':           safe_pct(summary['cagr']),
             'arr':            safe_pct(summary['arr']),
             'buy_count':      str(summary['buy_count']),
+            'sell_count':     str(summary.get('sell_count', 0)),
+            'total_tax':      sfmt(summary.get('total_tax', 0.0)),
+            'net_profit':     sfmt(summary.get('net_profit', summary['profit'])),
+            'net_pct':        sfmt(summary.get('net_pct', summary['pct_gain']), is_pct=True),
         }
+
+        def _signed_color(text_val: str) -> str:
+            """Return GREEN or RED based on numeric sign of a formatted value string."""
+            clean = text_val.replace('$', '').replace('%', '').replace('+', '').replace(',', '')
+            try:
+                return GREEN if float(clean) >= 0 else RED
+            except Exception:
+                return SUBTEXT
 
         for key, (var, lbl_w, kind) in self._result_vars.items():
             var.set(vals[key])
-            if kind == 'signed':
-                lbl_w.config(fg=GREEN if float(summary['profit']) >= 0 else RED)
-            elif kind == 'signed_pct':
-                num = summary['pct_gain'] if key == 'pct_gain' else \
-                      summary['cagr']     if key == 'cagr'     else \
-                      summary['arr']
-                try:
-                    lbl_w.config(fg=GREEN if float(num) >= 0 else RED)
-                except Exception:
-                    lbl_w.config(fg=SUBTEXT)
+            if kind in ('signed', 'signed_pct'):
+                fg = _signed_color(vals[key])
+                lbl_w.config(fg=fg)
             else:
                 lbl_w.config(fg=GREEN)
 
@@ -787,11 +882,13 @@ class StockSimulator(tk.Tk):
         gain   = f"{float(summary['pct_gain']):+.0f}pct"
         fname  = f"{ticker.upper()}_{strat}_{freq}_{start}_{end}_{gain}.png"
         out    = os.path.join(os.path.dirname(os.path.abspath(__file__)), fname)
+        sells     = summary.get('sell_count', 0)
+        sell_str  = f"  {sells} sells  •" if sells else ""
         try:
             self.fig.savefig(out, dpi=150, bbox_inches='tight',
                              facecolor=BG, edgecolor='none')
             self.status_var.set(
-                f"Done  •  {summary['buy_count']} buys  •  Saved → {fname}")
+                f"Done  •  {summary['buy_count']} buys  •{sell_str}  Saved → {fname}")
         except Exception as e:
             self.status_var.set(f"Done  •  Save failed: {e}")
 
