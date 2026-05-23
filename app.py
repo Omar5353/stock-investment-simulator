@@ -133,6 +133,11 @@ with st.sidebar:
 
     st.divider()
     run = st.button("▶  Run Simulation", type="primary", use_container_width=True)
+    st.markdown(
+        "<p style='color:#6c7086;font-size:0.72rem;margin-top:16px'>"
+        "Brought to you by<br>Mohammad Omar Faruk Murad</p>",
+        unsafe_allow_html=True
+    )
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -383,3 +388,12 @@ if strat == "ATH Buy & Sell" and summary.get('tax_breakdown'):
             f"Total Estimated Tax: ${total_all_tax:,.2f}</p>",
             unsafe_allow_html=True
         )
+
+# ── Footer ────────────────────────────────────────────────────────────────────
+st.divider()
+st.markdown(
+    "<p style='color:#6c7086;font-size:0.75rem;margin:0'>"
+    "Brought to you by Mohammad Omar Faruk Murad</p>",
+    unsafe_allow_html=True
+)
+

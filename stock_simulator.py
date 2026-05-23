@@ -252,6 +252,12 @@ class StockSimulator(tk.Tk):
         self.tax_btn.pack(fill='x', padx=12, pady=(0, 14))
         self.tax_btn.bind('<ButtonRelease-1>', lambda _: self._show_tax_breakdown())
 
+        # ── Credit ────────────────────────────────────────────────────────────
+        tk.Label(sidebar, text="Brought to you by Mohammad Omar Faruk Murad",
+                 bg=PANEL, fg=MUTED, font=('Segoe UI', 7),
+                 wraplength=240, justify='left').pack(
+                     anchor='w', padx=14, pady=(4, 12))
+
         # ── Plot area ─────────────────────────────────────────────────────────
         plot_frame = tk.Frame(self, bg=BG)
         plot_frame.pack(side='right', fill='both', expand=True, padx=6, pady=6)
