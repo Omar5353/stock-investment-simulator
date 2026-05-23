@@ -280,10 +280,11 @@ def simulate_drawdown_dca(df, start_date, end_date, amount, frequency,
 # ── ATH Buy & Sell ────────────────────────────────────────────────────────────
 
 def simulate_ath_buy_sell(df, start_date, end_date, amount, frequency,
-                           buy_pct=0.10, sell_pct=0.05):
+                           buy_pct=0.10, sell_pct=0.05, stop_buy_pct=0.0):
     """
     Buy phase: enter when close drops buy_pct% below rolling prior ATH.
-               Continue buying at `frequency` while in buying phase.
+               Continue buying at `frequency` while price stays below
+               (1 - stop_buy_pct) * prior_ath; 0 = buy until sell signal.
     Sell:      exit (sell ALL shares) when close rises sell_pct% above the
                prior ATH recorded at the start of the buy phase.
     Executes at next day's Open.
@@ -297,7 +298,8 @@ def simulate_ath_buy_sell(df, start_date, end_date, amount, frequency,
     df['prior_ath'] = df['Close'].expanding().max().shift(1)
 
     n           = len(df)
-    buying      = False
+    buying      = False   # in a buy phase (holding, awaiting sell signal)
+    buy_active  = False   # still placing new buy orders this phase
     cycle_id    = 0
     shares      = 0.0
     invested    = 0.0
@@ -329,6 +331,7 @@ def simulate_ath_buy_sell(df, start_date, end_date, amount, frequency,
             shares       = 0.0
             pending_sell = False
             buying       = False
+            buy_active   = False
 
         if pending_buy:
             s = amount / exec_p
@@ -343,15 +346,22 @@ def simulate_ath_buy_sell(df, start_date, end_date, amount, frequency,
         if pd.notna(prior_ath):
             # Enter buying phase
             if not buying and close <= (1 - buy_pct) * prior_ath:
-                buying   = True
-                cycle_id += 1
-                buy_ctr  = 0
-                ref_ath  = prior_ath   # lock reference ATH for sell target
+                buying     = True
+                buy_active = True
+                cycle_id  += 1
+                buy_ctr    = 0
+                ref_ath    = prior_ath   # lock reference ATH for sell target
 
-            # Schedule buy if in phase and on frequency schedule
-            if buying and (buy_ctr % step == 0) and i < n - 1:
+            # Stop adding new buys once price recovers past stop_buy_pct
+            if buying and buy_active and stop_buy_pct > 0 and \
+                    close >= (1 - stop_buy_pct) * prior_ath:
+                buy_active  = False
+                pending_buy = False   # cancel any already-queued buy
+
+            # Schedule buy if actively buying and on frequency schedule
+            if buying and buy_active and (buy_ctr % step == 0) and i < n - 1:
                 pending_buy = True
-            if buying:
+            if buying and buy_active:
                 buy_ctr += 1
 
             # Sell signal: close rose sell_pct% above ref ATH
@@ -540,6 +550,8 @@ class StockSimulator(tk.Tk):
                  bg=PANEL, fg=MUTED, font=FONT_SMALL).pack(anchor='w', padx=14, pady=(10, 4))
         lbl(self.ath_frame, "Buy when  (% below ATH)", top=2)
         self.v_ath_buy  = entry(self.ath_frame, "10")
+        lbl(self.ath_frame, "Stop buying  (% below ATH, 0 = off)", top=6)
+        self.v_ath_stop = entry(self.ath_frame, "0")
         lbl(self.ath_frame, "Sell when  (% above ATH at buy)", top=6)
         self.v_ath_sell = entry(self.ath_frame, "5")
 
@@ -689,14 +701,20 @@ class StockSimulator(tk.Tk):
         elif strat == "ATH Buy & Sell":
             try:
                 ath_buy  = float(self.v_ath_buy.get())
+                ath_stop = float(self.v_ath_stop.get())
                 ath_sell = float(self.v_ath_sell.get())
             except ValueError:
                 raise ValueError("ATH values must be numbers.")
             if not (0 < ath_buy < 100):
                 raise ValueError("Buy threshold must be between 0 and 100.")
+            if not (0 <= ath_stop < 100):
+                raise ValueError("Stop buying must be between 0 (off) and 100.")
+            if ath_stop > 0 and ath_stop >= ath_buy:
+                raise ValueError("Stop buying % must be less than Buy % (or 0 to disable).")
             if not (0 < ath_sell < 100):
                 raise ValueError("Sell threshold must be between 0 and 100.")
-            extra = {'ath_buy': ath_buy / 100, 'ath_sell': ath_sell / 100}
+            extra = {'ath_buy': ath_buy / 100, 'ath_stop': ath_stop / 100,
+                     'ath_sell': ath_sell / 100}
 
         return ticker, amount, start, end, strat, extra
 
@@ -732,7 +750,8 @@ class StockSimulator(tk.Tk):
             else:  # ATH Buy & Sell
                 daily, buy_df, sell_df, summary = simulate_ath_buy_sell(
                     df, start, end, amount, freq,
-                    buy_pct=extra['ath_buy'], sell_pct=extra['ath_sell'])
+                    buy_pct=extra['ath_buy'], stop_buy_pct=extra['ath_stop'],
+                    sell_pct=extra['ath_sell'])
 
             self.after(0, self._update_ui, ticker, daily, buy_df, sell_df, summary)
         except Exception as exc:
@@ -874,21 +893,27 @@ class StockSimulator(tk.Tk):
     # ── Save plots ────────────────────────────────────────────────────────────
 
     def _save_plots(self, ticker: str, summary: dict):
-        """Save current figure as PNG in the same directory as this script."""
+        """Save current figure as PNG inside a datetime-stamped subfolder."""
+        ts     = datetime.now().strftime('%Y%m%d_%H%M%S')
+        base   = os.path.dirname(os.path.abspath(__file__))
+        folder = os.path.join(base, ts)
+        os.makedirs(folder, exist_ok=True)
+
         strat  = self.v_strat.get().replace(' ', '_').replace('&', 'and')
         freq   = self.v_freq.get()
         start  = self.v_start.get().replace('-', '')
         end    = self.v_end.get().replace('-', '')
         gain   = f"{float(summary['pct_gain']):+.0f}pct"
         fname  = f"{ticker.upper()}_{strat}_{freq}_{start}_{end}_{gain}.png"
-        out    = os.path.join(os.path.dirname(os.path.abspath(__file__)), fname)
-        sells     = summary.get('sell_count', 0)
-        sell_str  = f"  {sells} sells  •" if sells else ""
+        out    = os.path.join(folder, fname)
+
+        sells    = summary.get('sell_count', 0)
+        sell_str = f"  {sells} sells  •" if sells else ""
         try:
             self.fig.savefig(out, dpi=150, bbox_inches='tight',
                              facecolor=BG, edgecolor='none')
             self.status_var.set(
-                f"Done  •  {summary['buy_count']} buys  •{sell_str}  Saved → {fname}")
+                f"Done  •  {summary['buy_count']} buys  •{sell_str}  {ts}/{fname}")
         except Exception as e:
             self.status_var.set(f"Done  •  Save failed: {e}")
 
